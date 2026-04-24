@@ -1,9 +1,11 @@
 """
-Gel Electrophoresis Simulator v8.0
+Gel Electrophoresis Simulator v10.0
 """
 
 # ── Standard library ──────────────────────────────────────────────────────────
 import os
+import csv
+import random
 import tempfile
 import threading
 import numpy as np
@@ -42,6 +44,7 @@ from kivy.uix.checkbox import CheckBox
 from kivy.uix.slider import Slider
 from kivy.uix.image import Image
 from kivy.uix.popup import Popup
+from kivy.uix.scatter import Scatter
 from kivy.core.window import Window
 from kivy.metrics import dp
 from kivy.clock import Clock
@@ -329,8 +332,57 @@ def _find_enzymes(names):
             if any(getattr(e,"__name__","").lower() == n.lower() for n in normed)]
 
 
+def compute_pcr_product(template: str, fwd: str, rev: str) -> list:
+    """
+    Simulate PCR: find all amplicons produced by fwd + rev primers on template.
+    Returns a list of amplicon sizes (bp).  Exact string match (no mismatches).
+    Both strands of the template are searched.
+    """
+    t   = _clean_seq(template)
+    f   = _clean_seq(fwd)
+    r   = _clean_seq(rev)
+    if not (t and f and r):
+        return []
+
+    rev_rc = str(Seq(r).reverse_complement())   # rev primer binds here on (+) strand
+    amplicons = []
+
+    # Search all forward primer hits
+    start = 0
+    while True:
+        pf = t.find(f, start)
+        if pf == -1:
+            break
+        # Look for rev primer (as rc) downstream of fwd
+        pr = t.find(rev_rc, pf + len(f))
+        if pr != -1:
+            amplicons.append(pr + len(r) - pf)
+        start = pf + 1
+
+    # Also search the reverse complement of template (circular / both strands)
+    t_rc = str(Seq(t).reverse_complement())
+    start = 0
+    while True:
+        pf = t_rc.find(f, start)
+        if pf == -1:
+            break
+        pr = t_rc.find(rev_rc, pf + len(f))
+        if pr != -1:
+            sz = pr + len(r) - pf
+            if sz not in amplicons:
+                amplicons.append(sz)
+        start = pf + 1
+
+    return sorted(amplicons, reverse=True)
+
+
 def compute_fragments(sequence: str, enzyme_names: list,
-                      circular: bool = False, no_digest: bool = False) -> list:
+                      circular: bool = False, no_digest: bool = False,
+                      completion: float = 1.0) -> list:
+    """
+    Restriction digest.  completion ∈ (0,1] simulates partial digestion:
+    each cut site is retained with probability = completion.
+    """
     seq = _clean_seq(sequence)
     if not seq:
         return []
@@ -342,9 +394,17 @@ def compute_fragments(sequence: str, enzyme_names: list,
     if not enzymes:
         return [len(s)]
 
-    cuts = sorted(set(p for ps in Analysis(enzymes, s).full().values() for p in ps))
-    if not cuts:
+    all_cuts = sorted(set(p for ps in Analysis(enzymes, s).full().values() for p in ps))
+    if not all_cuts:
         return [len(s)]
+
+    # Partial digest: randomly drop cut sites
+    if completion < 0.999:
+        cuts = sorted(c for c in all_cuts if random.random() < completion)
+        if not cuts:
+            return [len(s)]      # fully undigested
+    else:
+        cuts = all_cuts
 
     if circular:
         if len(cuts) == 1:
@@ -627,11 +687,11 @@ def open_native_folder_dialog(callback, start_path=None):
 class SampleBox(BoxLayout):
     def __init__(self, idx, remove_cb, status_cb, **kw):
         super().__init__(orientation="vertical", spacing=4,
-                         padding=(8,6,8,6), size_hint_y=None,
-                         height=dp(262), **kw)          # +27 dp for plasmid row
-        self.idx       = idx
-        self._remove   = remove_cb
-        self._status   = status_cb
+                         padding=(8, 6, 8, 6), size_hint_y=None,
+                         height=dp(355), **kw)
+        self.idx     = idx
+        self._remove = remove_cb
+        self._status = status_cb
         _panel_bg(self, radius=8)
 
         # ── Header ────────────────────────────────────────────────────────
@@ -640,66 +700,112 @@ class SampleBox(BoxLayout):
                            color=_ACCENT, font_size="13sp", halign="left",
                            size_hint_x=1)
         hdr.add_widget(self.title)
-
         imp = _btn("📂 Import", color=_BTN, size_hint_x=None, width=dp(88), font_size="11sp")
         imp.bind(on_press=lambda *_: open_native_file_dialog(self._on_imported))
         hdr.add_widget(imp)
-
         rm = _btn("✕", color=_DANGER, size_hint_x=None, width=dp(34), font_size="13sp")
         rm.bind(on_press=lambda *_: remove_cb(self))
         hdr.add_widget(rm)
         self.add_widget(hdr)
 
+        # ── Mode selector (Digest / PCR) ───────────────────────────────────
+        mrow = BoxLayout(size_hint_y=None, height=dp(26), spacing=8)
+        self.pcr_cb = CheckBox(size_hint_x=None, width=dp(22),
+                               color=(0.40, 0.85, 0.98, 1))
+        mrow.add_widget(self.pcr_cb)
+        mrow.add_widget(_lbl("PCR mode", size_hint=(None, None),
+                             height=dp(24), width=dp(80), font_size="10sp",
+                             color=(0.40, 0.85, 0.98, 1)))
+        mrow.add_widget(Label(size_hint_x=1))   # spacer
+        self.add_widget(mrow)
+        self.pcr_cb.bind(active=self._on_mode_change)
+
         # ── Sequence textarea ──────────────────────────────────────────────
-        self.seq = _inp(multiline=True, size_hint_y=None, height=dp(70),
-                        hint_text="Paste sequence or use 📂 Import …")
+        self.seq = _inp(multiline=True, size_hint_y=None, height=dp(60),
+                        hint_text="Paste template sequence or use 📂 Import …")
         self.add_widget(self.seq)
 
-        # ── Enzyme row ────────────────────────────────────────────────────
-        er = BoxLayout(size_hint_y=None, height=dp(30), spacing=6)
-        er.add_widget(_lbl("Enzymes:", size_hint=(None,None),
-                           height=dp(28), width=dp(68), font_size="11sp"))
+        # ── PCR primer inputs (shown in PCR mode only) ─────────────────────
+        self._pcr_box = BoxLayout(orientation="vertical", spacing=3,
+                                  size_hint_y=None, height=dp(62))
+        pr1 = BoxLayout(size_hint_y=None, height=dp(28), spacing=4)
+        pr1.add_widget(_lbl("Fwd:", size_hint=(None, None),
+                            height=dp(26), width=dp(36), font_size="10sp"))
+        self.fwd_inp = _inp(multiline=False, size_hint_x=1,
+                            hint_text="5′→3′ forward primer", font_size="10sp")
+        pr1.add_widget(self.fwd_inp)
+        self._pcr_box.add_widget(pr1)
+
+        pr2 = BoxLayout(size_hint_y=None, height=dp(28), spacing=4)
+        pr2.add_widget(_lbl("Rev:", size_hint=(None, None),
+                            height=dp(26), width=dp(36), font_size="10sp"))
+        self.rev_inp = _inp(multiline=False, size_hint_x=1,
+                            hint_text="5′→3′ reverse primer", font_size="10sp")
+        pr2.add_widget(self.rev_inp)
+        self._pcr_box.add_widget(pr2)
+
+        self._pcr_box.opacity  = 0
+        self._pcr_box.height   = 0
+        self.add_widget(self._pcr_box)
+
+        # ── Enzyme row (shown in Digest mode only) ─────────────────────────
+        self._enz_box = BoxLayout(size_hint_y=None, height=dp(30), spacing=6)
+        self._enz_box.add_widget(_lbl("Enzymes:", size_hint=(None, None),
+                                      height=dp(28), width=dp(68), font_size="11sp"))
         self.enzymes = _inp(multiline=False, size_hint_x=1,
                             hint_text="EcoRI, BamHI …")
-        er.add_widget(self.enzymes)
+        self._enz_box.add_widget(self.enzymes)
         self.pick = Spinner(text="＋ Add", values=COMMON_ENZYMES,
                             size_hint_x=None, width=dp(110), font_size="11sp")
         self.pick.bind(text=self._add_enz)
-        er.add_widget(self.pick)
-        self.add_widget(er)
+        self._enz_box.add_widget(self.pick)
+        self.add_widget(self._enz_box)
 
         # ── Options row ───────────────────────────────────────────────────
         opt = BoxLayout(size_hint_y=None, height=dp(28), spacing=4)
         self.circ = CheckBox(size_hint_x=None, width=dp(22), color=_ACCENT)
         opt.add_widget(self.circ)
-        opt.add_widget(_lbl("Circular", size_hint=(None,None),
+        opt.add_widget(_lbl("Circular", size_hint=(None, None),
                             height=dp(26), width=dp(60), font_size="11sp"))
         self.nodig = CheckBox(size_hint_x=None, width=dp(22), color=_ACCENT)
         opt.add_widget(self.nodig)
-        opt.add_widget(_lbl("No digest", size_hint=(None,None),
+        opt.add_widget(_lbl("No digest", size_hint=(None, None),
                             height=dp(26), width=dp(72), font_size="11sp"))
-        opt.add_widget(_lbl("Label:", size_hint=(None,None),
+        opt.add_widget(_lbl("Label:", size_hint=(None, None),
                             height=dp(26), width=dp(48), font_size="11sp"))
-        self.lane_lbl = _inp(multiline=False, size_hint_x=1,
-                             hint_text="optional")
+        self.lane_lbl = _inp(multiline=False, size_hint_x=1, hint_text="optional")
         opt.add_widget(self.lane_lbl)
         self.add_widget(opt)
 
         # ── Plasmid isolation row ──────────────────────────────────────────
         plrow = BoxLayout(size_hint_y=None, height=dp(26), spacing=4)
-        self.plasmid_cb = CheckBox(size_hint_x=None, width=dp(22), color=(0.98, 0.70, 0.22, 1))
+        self.plasmid_cb = CheckBox(size_hint_x=None, width=dp(22),
+                                   color=(0.98, 0.70, 0.22, 1))
         plrow.add_widget(self.plasmid_cb)
-        plrow.add_widget(_lbl(
-            "Plasmid isolation (shows SC / OC / Linear forms)",
-            size_hint=(1, None), height=dp(24),
-            color=(0.88, 0.72, 0.30, 1), font_size="10sp",
-            halign="left", text_size=(None, None)))
+        plrow.add_widget(_lbl("Plasmid isolation (SC / OC / Linear forms)",
+                              size_hint=(1, None), height=dp(24),
+                              color=(0.88, 0.72, 0.30, 1), font_size="10sp",
+                              halign="left", text_size=(None, None)))
         self.add_widget(plrow)
 
+        # ── Partial digest slider ──────────────────────────────────────────
+        pdrow = BoxLayout(size_hint_y=None, height=dp(28), spacing=4)
+        pdrow.add_widget(_lbl("Digest %:", size_hint=(None, None),
+                              height=dp(26), width=dp(66), font_size="10sp"))
+        self.pd_slider = Slider(min=0.05, max=1.0, value=1.0, step=0.05,
+                                size_hint_x=1)
+        self.pd_lbl = _lbl("100%", size_hint=(None, None), height=dp(26),
+                            width=dp(38), color=_GREEN, font_size="10sp")
+        self.pd_slider.bind(value=lambda _, v: setattr(
+            self.pd_lbl, "text", f"{int(round(v*100))}%"))
+        pdrow.add_widget(self.pd_slider)
+        pdrow.add_widget(self.pd_lbl)
+        self.add_widget(pdrow)
+
         # ── Fragment report ────────────────────────────────────────────────
-        self.frag_lbl = _lbl("No fragments yet.", size_hint=(1,None),
+        self.frag_lbl = _lbl("No fragments yet.", size_hint=(1, None),
                              height=dp(20), color=_HINT, font_size="10sp",
-                             halign="left", text_size=(None,None))
+                             halign="left", text_size=(None, None))
         self.add_widget(self.frag_lbl)
 
     # ── public interface ──────────────────────────────────────────────────
@@ -707,46 +813,86 @@ class SampleBox(BoxLayout):
         self.idx = i
         self.title.text = f"[b]Lane {i}[/b]"
 
+    def get_sequence(self) -> str:
+        return _clean_seq(self.seq.text)
+
+    def get_enzyme_names(self) -> list:
+        return [e.strip() for e in self.enzymes.text.split(",") if e.strip()]
+
     def get_fragments(self, gel_pct: float = 1.0) -> list:
-        seq  = _clean_seq(self.seq.text)
+        seq = _clean_seq(self.seq.text)
+        completion = round(self.pd_slider.value, 3)
+
+        # ── PCR mode ──────────────────────────────────────────────────────
+        if self.pcr_cb.active:
+            fwd = _clean_seq(self.fwd_inp.text)
+            rev = _clean_seq(self.rev_inp.text)
+            if not (seq and fwd and rev):
+                self.frag_lbl.text  = "Enter template + both primers."
+                self.frag_lbl.color = _HINT
+                return []
+            frags = compute_pcr_product(seq, fwd, rev)
+            if frags:
+                parts = [f"{f//1000:.1f}kb" if f >= 1000 else f"{f}bp"
+                         for f in frags[:5]]
+                self.frag_lbl.text  = "PCR: " + ", ".join(parts)
+                self.frag_lbl.color = (0.40, 0.85, 0.98, 1)
+            else:
+                self.frag_lbl.text  = "No amplicon — primers not found."
+                self.frag_lbl.color = _HINT
+            return sorted(frags, reverse=True)
+
+        # ── Restriction digest mode ────────────────────────────────────────
         if not seq:
             self.frag_lbl.text  = "No sequence entered."
             self.frag_lbl.color = _HINT
             return []
-        enz   = [e.strip() for e in self.enzymes.text.split(",") if e.strip()]
-        frags = sorted(compute_fragments(seq, enz,
-                                        circular=self.circ.active,
-                                        no_digest=self.nodig.active), reverse=True)
 
-        # ── Plasmid isolation mode ─────────────────────────────────────────
-        # If checked, replace each fragment with its three topological forms.
-        # Only applies when no enzymes cut (undigested plasmid) — after
-        # restriction digestion the fragments are linear anyway.
-        enzymes_typed = bool([e for e in self.enzymes.text.split(",") if e.strip()])
-        if self.plasmid_cb.active and not enzymes_typed and not self.nodig.active:
+        enz   = self.get_enzyme_names()
+        frags = sorted(compute_fragments(seq, enz,
+                                         circular=self.circ.active,
+                                         no_digest=self.nodig.active,
+                                         completion=completion), reverse=True)
+
+        # Plasmid topology mode (undigested only)
+        if self.plasmid_cb.active and not enz and not self.nodig.active:
             topo_bands = []
             for bp in frags:
                 for form in get_plasmid_forms(bp, gel_pct):
-                    topo_bands.append(form)   # (apparent_bp, label, alpha)
+                    topo_bands.append(form)
             if topo_bands:
-                form_sizes = [b[0] for b in topo_bands]
-                lbl_parts  = [f"{b[1]}:{b[0]//1000:.1f}kb" if b[0]>=1000
-                               else f"{b[1]}:{b[0]}bp" for b in topo_bands]
+                lbl_parts = [f"{b[1]}:{b[0]//1000:.1f}kb" if b[0] >= 1000
+                             else f"{b[1]}:{b[0]}bp" for b in topo_bands]
                 self.frag_lbl.text  = "Forms: " + ", ".join(lbl_parts[:6])
                 self.frag_lbl.color = (0.98, 0.82, 0.30, 1)
             return topo_bands
 
         if frags:
-            parts = [f"{f//1000:.1f}kb" if f>=1000 else f"{f}bp" for f in frags[:7]]
-            trail = f" … +{len(frags)-7}" if len(frags)>7 else ""
-            self.frag_lbl.text  = "Fragments: " + ", ".join(parts) + trail
-            self.frag_lbl.color = _GREEN
+            tag   = "" if completion >= 0.999 else f" [partial {int(completion*100)}%]"
+            parts = [f"{f//1000:.1f}kb" if f >= 1000 else f"{f}bp"
+                     for f in frags[:7]]
+            trail = f" … +{len(frags)-7}" if len(frags) > 7 else ""
+            self.frag_lbl.text  = "Fragments: " + ", ".join(parts) + trail + tag
+            self.frag_lbl.color = _GREEN if completion >= 0.999 else (0.95, 0.70, 0.25, 1)
         else:
             self.frag_lbl.text  = "No cut sites found."
             self.frag_lbl.color = _HINT
         return frags
 
     # ── private ───────────────────────────────────────────────────────────
+    def _on_mode_change(self, cb, active):
+        """Toggle between PCR primer inputs and enzyme row."""
+        if active:
+            self._pcr_box.opacity = 1
+            self._pcr_box.height  = dp(62)
+            self._enz_box.opacity = 0.3
+            self._enz_box.disabled = True
+        else:
+            self._pcr_box.opacity = 0
+            self._pcr_box.height  = 0
+            self._enz_box.opacity = 1
+            self._enz_box.disabled = False
+
     def _add_enz(self, spinner, text):
         if text and text != "＋ Add":
             cur = self.enzymes.text.strip()
@@ -907,20 +1053,38 @@ class GelElectrophoresisApp(App):
             start_path=self._export_folder))
         sc.add_widget(folder_btn)
 
-        exp_btn = _btn("💾  Export 600 DPI PNG", color=(0.28, 0.28, 0.50, 1),
-                       font_size="11sp", size_hint_y=None, height=dp(34))
+        exp_btn = _btn("💾  Export PNG", color=(0.28, 0.28, 0.50, 1),
+                       font_size="11sp", size_hint_y=None, height=dp(30))
         exp_btn.bind(on_press=self._export)
         sc.add_widget(exp_btn)
+
+        svg_btn = _btn("📐  Export SVG", color=(0.22, 0.40, 0.50, 1),
+                       font_size="11sp", size_hint_y=None, height=dp(30))
+        svg_btn.bind(on_press=self._export_svg)
+        sc.add_widget(svg_btn)
+
+        csv_btn = _btn("📊  Export CSV", color=(0.22, 0.45, 0.30, 1),
+                       font_size="11sp", size_hint_y=None, height=dp(30))
+        csv_btn.bind(on_press=self._export_csv)
+        sc.add_widget(csv_btn)
 
         left.add_widget(sc)
         body.add_widget(left)
 
-        # ── CENTER: Gel image (dominant) ──────────────────────────────────
+        # ── CENTER: Gel image (dominant, zoomable) ────────────────────────
         center = BoxLayout(orientation="vertical", spacing=4, size_hint_x=0.44)
 
+        self._scatter = Scatter(
+            do_rotation=False,
+            scale=1.0,
+            size_hint=(1, 1)
+        )
         self.gel_img = Image(size_hint=(1, 1), allow_stretch=True, keep_ratio=True)
         _panel_bg(self.gel_img, radius=8)
-        center.add_widget(self.gel_img)
+        self._scatter.add_widget(self.gel_img)
+        # Keep gel_img filling the scatter at all times
+        self._scatter.bind(size=lambda sc, sz: setattr(self.gel_img, "size", sz))
+        center.add_widget(self._scatter)
 
         analyze_btn = _btn("🔬  Analyze & Preview Gel",
                            color=(0.25, 0.50, 0.28, 1),
@@ -933,13 +1097,17 @@ class GelElectrophoresisApp(App):
         # ── RIGHT: Sample lanes ───────────────────────────────────────────
         right = BoxLayout(orientation="vertical", spacing=6, size_hint_x=0.34)
 
-        rh = BoxLayout(size_hint_y=None, height=dp(40), spacing=8, padding=(0, 4))
+        rh = BoxLayout(size_hint_y=None, height=dp(40), spacing=6, padding=(0, 4))
         rh.add_widget(Label(text="[b]🧪  Sample Lanes[/b]", markup=True,
                             color=_ACCENT, font_size="13sp"))
         add_b = _btn("＋  Lane", color=_ACCENT,
-                     size_hint_x=None, width=dp(88), font_size="11sp")
+                     size_hint_x=None, width=dp(80), font_size="11sp")
         add_b.bind(on_press=lambda *_: self._add_lane())
         rh.add_widget(add_b)
+        cmp_b = _btn("⚗  Compare", color=(0.40, 0.28, 0.55, 1),
+                     size_hint_x=None, width=dp(90), font_size="11sp")
+        cmp_b.bind(on_press=lambda *_: self._compare_digests())
+        rh.add_widget(cmp_b)
         right.add_widget(rh)
 
         self.lane_grid = GridLayout(cols=1, spacing=8, size_hint_y=None, padding=(0, 4))
@@ -1156,6 +1324,120 @@ class GelElectrophoresisApp(App):
             self._set_status(f"⚠  Export error: {exc}", err=True)
 
 
+    # ── Multiplex digest comparison ───────────────────────────────────────
+    def _compare_digests(self):
+        """
+        Find the first lane that has a sequence and at least 1 enzyme.
+        Auto-populates new lanes:
+          • Undigested control (no cut)
+          • One lane per individual enzyme (single digests)
+          • One lane with all enzymes together (only when ≥2 enzymes present)
+        """
+        src = None
+        for sb in self.lanes:
+            if _clean_seq(sb.seq.text) and len(sb.get_enzyme_names()) >= 1:
+                src = sb
+                break
+
+        if src is None:
+            self._set_status(
+                "⚠  Compare Digests: add a lane with a sequence and at least 1 enzyme.",
+                err=True)
+            return
+
+        seq  = _clean_seq(src.seq.text)
+        enzs = src.get_enzyme_names()
+        circ = src.circ.active
+        base = src.lane_lbl.text.strip() or "DNA"
+
+        # Build combo list: undigested + each single enzyme + combined (if >1)
+        combos = []
+        combos.append(([], True,  f"{base[:12]} Undig"))          # no-digest control
+        for e in enzs:
+            combos.append(([e], False, f"{base[:10]} {e}"))        # single digest
+        if len(enzs) >= 2:
+            tag = "+".join(enzs)
+            combos.append((enzs, False, f"{base[:8]} {tag}"[:18])) # combined digest
+
+        available = 9 - len(self.lanes)
+        if available <= 0:
+            self._set_status("⚠  No room — remove some lanes first (max 9).", err=True)
+            return
+        combos = combos[:available]
+
+        added = 0
+        for enz_list, is_nodig, lbl in combos:
+            if len(self.lanes) >= 9:
+                break
+            nb = SampleBox(len(self.lanes) + 1, self._remove_lane, self._set_status)
+            nb.seq.text       = seq
+            nb.enzymes.text   = ", ".join(enz_list)
+            nb.circ.active    = circ
+            nb.nodig.active   = is_nodig
+            nb.lane_lbl.text  = lbl[:18]
+            self.lanes.append(nb)
+            self.lane_grid.add_widget(nb)
+            added += 1
+
+        self._set_status(f"✓ Added {added} comparison lanes for '{base}'.")
+        self._analyze()
+
+    # ── SVG export ───────────────────────────────────────────────────────
+    def _export_svg(self, *_):
+        gel_pct, voltage, buffer, time_h, ladder = self._get_params()
+        if not ladder:
+            self._set_status("⚠  No ladder selected.", err=True)
+            return
+        frags_list = [sb.get_fragments(gel_pct=gel_pct) for sb in self.lanes]
+        labels     = [sb.lane_lbl.text.strip() for sb in self.lanes]
+        stamp      = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out        = os.path.join(self._export_folder, f"gel_{stamp}.svg")
+        try:
+            fig = render_gel(ladder, frags_list, labels,
+                             gel_pct=gel_pct, voltage=voltage,
+                             buffer=buffer, time_h=time_h,
+                             dpi=150, img_w=700, img_h=1400)
+            os.makedirs(self._export_folder, exist_ok=True)
+            fig.savefig(out, format="svg", bbox_inches="tight",
+                        facecolor=fig.get_facecolor())
+            plt.close(fig)
+            self._set_status(f"✓ SVG exported →  {out}")
+        except Exception as exc:
+            self._set_status(f"⚠  SVG export error: {exc}", err=True)
+
+    # ── CSV fragment table export ─────────────────────────────────────────
+    def _export_csv(self, *_):
+        gel_pct, voltage, buffer, time_h, ladder = self._get_params()
+        frags_list = [sb.get_fragments(gel_pct=gel_pct) for sb in self.lanes]
+        labels     = [sb.lane_lbl.text.strip() or f"Lane {i+1}"
+                      for i, sb in enumerate(self.lanes)]
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out   = os.path.join(self._export_folder, f"gel_fragments_{stamp}.csv")
+        try:
+            os.makedirs(self._export_folder, exist_ok=True)
+            with open(out, "w", newline="") as fh:
+                w = csv.writer(fh)
+                w.writerow(["Source", "Lane", "Fragment_#", "Size_bp",
+                            "Size_kb", "Notes"])
+                # Ladder
+                for s in sorted(ladder, reverse=True):
+                    w.writerow(["Ladder", "MW", "", s,
+                                f"{s/1000:.3f}", "Marker band"])
+                # Sample lanes
+                for lane_i, (frags, lbl) in enumerate(zip(frags_list, labels), 1):
+                    for frag_i, item in enumerate(frags, 1):
+                        if isinstance(item, (list, tuple)) and len(item) == 3:
+                            bp, form, _alpha = item
+                            note = f"Topology: {form}"
+                        else:
+                            bp   = item
+                            note = ""
+                        w.writerow([lbl, lane_i, frag_i, int(bp),
+                                    f"{bp/1000:.3f}", note])
+            self._set_status(f"✓ CSV exported →  {out}")
+        except Exception as exc:
+            self._set_status(f"⚠  CSV export error: {exc}", err=True)
+
 # ══════════════════════════════════════════════════════════════════════════════
-if __name__ == "__main__":
+if __name__ == '__main__':
     GelElectrophoresisApp().run()
